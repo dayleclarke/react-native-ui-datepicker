@@ -4,12 +4,12 @@ import React, {
   useMemo,
   useReducer,
   useRef,
+  useState,
 } from 'react';
 import { I18nManager } from 'react-native';
 import {
   dateToUnix,
   getEndOfDay,
-  getStartOfDay,
   areDatesOnSameDay,
   removeTime,
 } from './utils';
@@ -48,6 +48,18 @@ dayjs.extend(utc);
 dayjs.extend(timezone);
 dayjs.extend(duration);
 dayjs.extend(jalaliday);
+
+const isSameMinute = (a: dayjs.Dayjs, b: dayjs.Dayjs) =>
+  a.year() === b.year() &&
+  a.month() === b.month() &&
+  a.date() === b.date() &&
+  a.hour() === b.hour() &&
+  a.minute() === b.minute();
+
+const defer = (fn: () => void) => {
+  if (typeof queueMicrotask === 'function') queueMicrotask(fn);
+  else setTimeout(fn, 0);
+};
 
 export interface DatePickerSingleProps extends DatePickerBaseProps {
   mode: 'single';
@@ -117,11 +129,22 @@ const DateTimePicker = (
     use12Hours,
   } = props;
 
-  dayjs.tz.setDefault(timeZone);
-  dayjs.calendar(calendar);
-  dayjs.locale(locale);
+  const withTZ = useCallback(
+    (d: dayjs.Dayjs | Date | string | number | null | undefined) =>
+      dayjs.isDayjs(d) ? d.tz(timeZone, true) : dayjs.tz(d as any, timeZone),
+    [timeZone]
+  );
+
+  // Apply global dayjs config only when inputs change
+  useEffect(() => {
+    if (timeZone) dayjs.tz.setDefault(timeZone);
+    if ((dayjs as any).calendar && calendar) (dayjs as any).calendar(calendar);
+    if (locale) dayjs.locale(locale);
+  }, [timeZone, calendar, locale]);
 
   const prevTimezone = usePrevious(timeZone);
+  const userChangeRef = useRef(false); // blocks effect while wheels update
+  const selectSeqRef = useRef(0);
 
   const initialCalendarView: CalendarViews = useMemo(
     () => (mode !== 'single' && initialView === 'time' ? 'day' : initialView),
@@ -139,59 +162,32 @@ const DateTimePicker = (
   const initialState: LocalState = useMemo(() => {
     let initialDate = dayjs().tz(timeZone);
 
-    if (mode === 'single' && date) {
-      initialDate = dayjs(date);
-    }
+    if (mode === 'single' && date) initialDate = withTZ(date);
+    if (mode === 'range' && startDate) initialDate = withTZ(startDate);
+    if (mode === 'multiple' && dates && dates.length > 0)
+      initialDate = withTZ(dates[0]);
+    if (minDate && initialDate.isBefore(minDate)) initialDate = withTZ(minDate);
+    if (month !== undefined && month && month >= 0 && month <= 11)
+      initialDate = initialDate.tz(timeZone, true).month(month);
+    if (year !== undefined && year >= 0)
+      initialDate = initialDate.tz(timeZone, true).year(year);
+    let _date = (date ? withTZ(date as any) : date) as DateType;
+    if (_date && maxDate && withTZ(_date).isAfter(maxDate))
+      _date = withTZ(maxDate);
+    if (_date && minDate && withTZ(_date).isBefore(minDate))
+      _date = withTZ(minDate);
 
-    if (mode === 'range' && startDate) {
-      initialDate = dayjs(startDate);
-    }
+    let start = (startDate ? withTZ(startDate as any) : startDate) as DateType;
+    if (start && maxDate && withTZ(start as any).isAfter(maxDate))
+      start = withTZ(maxDate as any);
+    if (start && minDate && withTZ(start as any).isBefore(minDate))
+      start = withTZ(minDate as any);
 
-    if (mode === 'multiple' && dates && dates.length > 0) {
-      initialDate = dayjs(dates[0]);
-    }
-
-    if (minDate && initialDate.isBefore(minDate)) {
-      initialDate = dayjs(minDate);
-    }
-
-    if (month !== undefined && month && month >= 0 && month <= 11) {
-      initialDate = initialDate.month(month);
-    }
-
-    if (year !== undefined && year >= 0) {
-      initialDate = initialDate.year(year);
-    }
-
-    let _date = (date ? dayjs(date) : date) as DateType;
-
-    if (_date && maxDate && dayjs(_date).isAfter(maxDate)) {
-      _date = dayjs(maxDate);
-    }
-
-    if (_date && minDate && dayjs(_date).isBefore(minDate)) {
-      _date = dayjs(minDate);
-    }
-
-    let start = (startDate ? dayjs(startDate) : startDate) as DateType;
-
-    if (start && maxDate && dayjs(start).isAfter(maxDate)) {
-      start = dayjs(maxDate);
-    }
-
-    if (start && minDate && dayjs(start).isBefore(minDate)) {
-      start = dayjs(minDate);
-    }
-
-    let end = (endDate ? dayjs(endDate) : endDate) as DateType;
-
-    if (end && maxDate && dayjs(end).isAfter(maxDate)) {
-      end = dayjs(maxDate);
-    }
-
-    if (end && minDate && dayjs(end).isBefore(minDate)) {
-      end = dayjs(minDate);
-    }
+    let end = (endDate ? withTZ(endDate) : endDate) as DateType;
+    if (end && maxDate && withTZ(end as any).isAfter(maxDate))
+      end = withTZ(maxDate as any);
+    if (end && minDate && withTZ(end as any).isBefore(minDate))
+      end = withTZ(minDate as any);
 
     return {
       date: _date,
@@ -204,19 +200,28 @@ const DateTimePicker = (
       isRTL: calendar === 'jalali' || I18nManager.isRTL,
     };
   }, [
+    timeZone,
     mode,
-    calendar,
     date,
+    withTZ,
     startDate,
-    endDate,
     dates,
     minDate,
-    maxDate,
     month,
     year,
-    timeZone,
+    maxDate,
+    endDate,
     initialCalendarView,
+    calendar,
   ]);
+
+  const [timeSeed, setTimeSeed] = useState<{
+    hour: number;
+    minute: number;
+  } | null>(null);
+  const lastNonZeroTimeRef = useRef<{ hour: number; minute: number } | null>(
+    null
+  );
 
   const [state, dispatch] = useReducer(
     (prevState: LocalState, action: CalendarAction) => {
@@ -237,30 +242,21 @@ const DateTimePicker = (
             currentYear: action.payload,
           };
         case CalendarActionKind.CHANGE_SELECTED_DATE:
-          const { date: selectedDate } = action.payload;
           return {
             ...prevState,
-            date: selectedDate,
-            currentDate: selectedDate,
+            date: action.payload.date,
+            currentDate: action.payload.date ?? prevState.currentDate,
           };
         case CalendarActionKind.CHANGE_SELECTED_RANGE:
-          const { startDate: start, endDate: end } = action.payload;
           return {
             ...prevState,
-            startDate: start,
-            endDate: end,
+            startDate: action.payload.startDate,
+            endDate: action.payload.endDate,
           };
         case CalendarActionKind.CHANGE_SELECTED_MULTIPLE:
-          const { dates: selectedDates } = action.payload;
-          return {
-            ...prevState,
-            dates: selectedDates,
-          };
+          return { ...prevState, dates: action.payload.dates };
         case CalendarActionKind.SET_IS_RTL:
-          return {
-            ...prevState,
-            isRTL: action.payload,
-          };
+          return { ...prevState, isRTL: action.payload };
         case CalendarActionKind.RESET_STATE:
           return action.payload;
         default:
@@ -278,202 +274,292 @@ const DateTimePicker = (
       ...initialState,
       isRTL: calendar === 'jalali' || I18nManager.isRTL,
     };
-
-    dispatch({ type: CalendarActionKind.RESET_STATE, payload: newState });
+    defer(() => {
+      dispatch({ type: CalendarActionKind.RESET_STATE, payload: newState });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [calendar]);
 
   useEffect(() => {
     if (prevTimezone !== timeZone) {
       const newDate = dayjs().tz(timeZone);
-      dispatch({
-        type: CalendarActionKind.CHANGE_CURRENT_DATE,
-        payload: newDate,
+      defer(() => {
+        dispatch({
+          type: CalendarActionKind.CHANGE_CURRENT_DATE,
+          payload: newDate,
+        });
       });
     }
   }, [timeZone, prevTimezone]);
 
   useEffect(() => {
     if (mode === 'single') {
-      let _date =
-        (date &&
-          (timePicker
-            ? dayjs.tz(date, timeZone)
-            : getStartOfDay(dayjs.tz(date, timeZone)))) ??
-        date;
-
-      if (_date && maxDate && dayjs.tz(_date, timeZone).isAfter(maxDate)) {
-        _date = dayjs.tz(maxDate, timeZone);
+      if (userChangeRef.current) {
+        return;
+      }
+      if (typeof date === 'undefined') {
+        return;
       }
 
-      if (_date && minDate && dayjs.tz(_date, timeZone).isBefore(minDate)) {
-        _date = dayjs.tz(minDate, timeZone);
+      let next = withTZ(date);
+      if (maxDate && next.isAfter(maxDate)) next = withTZ(maxDate);
+      if (minDate && next.isBefore(minDate)) next = withTZ(minDate);
+      const cur = withTZ(stateRef.current.date ?? stateRef.current.currentDate);
+      if (isSameMinute(cur, next)) {
+        return;
       }
 
-      dispatch({
-        type: CalendarActionKind.CHANGE_SELECTED_DATE,
-        payload: { date: _date },
-      });
-
-      if (prevTimezone !== timeZone) {
-        (onChange as SingleChange)({
-          date: _date ? dayjs(_date).toDate() : _date,
+      defer(() => {
+        dispatch({
+          type: CalendarActionKind.CHANGE_SELECTED_DATE,
+          payload: { date: next },
         });
-      }
+      });
     } else if (mode === 'range') {
-      let start = (
-        startDate ? dayjs.tz(startDate, timeZone) : startDate
-      ) as DateType;
+      let start = (startDate ? withTZ(startDate) : startDate) as DateType;
+      if (start && maxDate && withTZ(start as any).isAfter(maxDate))
+        start = withTZ(maxDate as any);
+      if (start && minDate && withTZ(start as any).isBefore(minDate))
+        start = withTZ(minDate as any);
 
-      if (start && maxDate && dayjs.tz(start, timeZone).isAfter(maxDate)) {
-        start = dayjs.tz(maxDate, timeZone);
-      }
+      let end = (endDate ? withTZ(endDate) : endDate) as DateType;
+      if (end && maxDate && withTZ(end as any).isAfter(maxDate))
+        end = withTZ(maxDate as any);
+      if (end && minDate && withTZ(end as any).isBefore(minDate))
+        end = withTZ(minDate as any);
 
-      if (start && minDate && dayjs.tz(start, timeZone).isBefore(minDate)) {
-        start = dayjs.tz(minDate, timeZone);
-      }
-
-      let end = (endDate ? dayjs.tz(endDate, timeZone) : endDate) as DateType;
-
-      if (end && maxDate && dayjs.tz(end, timeZone).isAfter(maxDate)) {
-        end = dayjs.tz(maxDate, timeZone);
-      }
-
-      if (end && minDate && dayjs.tz(end, timeZone).isBefore(minDate)) {
-        end = dayjs.tz(minDate, timeZone);
-      }
-
-      dispatch({
-        type: CalendarActionKind.CHANGE_SELECTED_RANGE,
-        payload: {
-          startDate: start,
-          endDate: end,
-        },
+      defer(() => {
+        dispatch({
+          type: CalendarActionKind.CHANGE_SELECTED_RANGE,
+          payload: { startDate: start, endDate: end },
+        });
       });
 
       if (prevTimezone !== timeZone) {
-        (onChange as RangeChange)({
-          startDate: start ? dayjs(start).toDate() : start,
-          endDate: end ? dayjs(end).toDate() : end,
+        defer(() => {
+          (onChange as RangeChange)?.({
+            startDate: start ? dayjs(start).toDate() : start,
+            endDate: end ? dayjs(end).toDate() : end,
+          });
         });
       }
     } else if (mode === 'multiple') {
-      const _dates = dates?.map((date) =>
-        dayjs(date).tz(timeZone)
-      ) as DateType[];
-
-      dispatch({
-        type: CalendarActionKind.CHANGE_SELECTED_MULTIPLE,
-        payload: { dates: _dates },
+      const _dates = dates?.map((d) => withTZ(d)) as DateType[];
+      defer(() => {
+        dispatch({
+          type: CalendarActionKind.CHANGE_SELECTED_MULTIPLE,
+          payload: { dates: _dates },
+        });
       });
 
       if (prevTimezone !== timeZone) {
-        (onChange as MultiChange)({
-          dates: _dates.map((item) => dayjs(item).toDate()),
-          change: 'updated',
+        defer(() => {
+          (onChange as MultiChange)?.({
+            dates: _dates.map((item) => dayjs(item).toDate()),
+            change: 'updated',
+          });
         });
       }
     }
   }, [
     mode,
     date,
+    minDate,
+    maxDate,
+    timeZone,
     startDate,
     endDate,
     dates,
-    minDate,
-    maxDate,
-    timePicker,
     prevTimezone,
-    timeZone,
-    calendar,
+    withTZ,
+    onChange,
   ]);
 
-  const setCalendarView = useCallback((view: CalendarViews) => {
-    dispatch({ type: CalendarActionKind.SET_CALENDAR_VIEW, payload: view });
-  }, []);
+  // Change calendar view; seed time when entering 'time' (deferred)
+  const setCalendarView = useCallback(
+    (view: CalendarViews) => {
+      const prevView = stateRef.current.calendarView;
+      if (view === prevView) return;
+
+      if (view === 'time' && prevView !== 'time') {
+        const cur = withTZ(
+          stateRef.current.date ?? stateRef.current.currentDate
+        );
+        const seedH = cur.hour();
+        const seedM = cur.minute();
+
+        setTimeSeed({ hour: seedH, minute: seedM });
+
+        const merged = cur.hour(seedH).minute(seedM);
+        const existing = withTZ(
+          stateRef.current.date ?? stateRef.current.currentDate
+        );
+
+        if (!isSameMinute(existing, merged)) {
+          defer(() => {
+            dispatch({
+              type: CalendarActionKind.CHANGE_SELECTED_DATE,
+              payload: { date: merged },
+            });
+            (onChange as SingleChange | undefined)?.({ date: merged.toDate() });
+          });
+        }
+      }
+
+      defer(() => {
+        dispatch({ type: CalendarActionKind.SET_CALENDAR_VIEW, payload: view });
+      });
+    },
+    [withTZ, onChange]
+  );
+
+  const seedHour = timeSeed?.hour ?? null;
+  const seedMinute = timeSeed?.minute ?? null;
 
   const onSelectDate = useCallback(
     (selectedDate: DateType) => {
-      if (onChange) {
-        if (mode === 'single') {
-          const newDate = timePicker
-            ? dayjs.tz(selectedDate, timeZone)
-            : dayjs.tz(getStartOfDay(selectedDate), timeZone);
+      if (!onChange) return;
 
+      if (mode === 'single') {
+        userChangeRef.current = true;
+
+        // Keep wall-clock from wheels (no DST shift on parse)
+        const picked = dayjs(selectedDate as any).tz(timeZone, true);
+        const pickedHasTime = picked.hour() !== 0 || picked.minute() !== 0;
+
+        // Reference time (current value or last seed)
+        const base = withTZ(
+          stateRef.current.date ??
+            stateRef.current.currentDate ??
+            dayjs().tz(timeZone)
+        );
+        const refH = typeof seedHour === 'number' ? seedHour : base.hour();
+        const refM =
+          typeof seedMinute === 'number' ? seedMinute : base.minute();
+
+        let next: dayjs.Dayjs;
+
+        if (pickedHasTime) {
+          // Spike guards: if only one wheel changed, don't allow the other to jump to 0
+          let h = picked.hour();
+          let m = picked.minute();
+
+          next = picked.hour(h).minute(m);
+
+          // keep timeSeed fresh when user explicitly picks a time
+          setTimeSeed({ hour: next.hour(), minute: next.minute() });
+        } else {
+          // Date-only selection: merge existing (or seed) time
+          next = picked
+            .hour(refH)
+            .minute(refM)
+            .second(base.second())
+            .millisecond(base.millisecond());
+        }
+
+        // 👉 bump sequence AFTER computing next, so late commits can be dropped
+        const mySeq = ++selectSeqRef.current;
+
+        // Clamp to min/max using withTZ for consistency
+        if (maxDate && withTZ(next).isAfter(maxDate)) next = withTZ(maxDate);
+        if (minDate && withTZ(next).isBefore(minDate)) next = withTZ(minDate);
+
+        const existing = withTZ(
+          stateRef.current.date ?? stateRef.current.currentDate
+        );
+        if (isSameMinute(existing, next)) {
+          userChangeRef.current = false;
+          return;
+        }
+
+        const hOut = next.hour();
+        const mOut = next.minute();
+        if (hOut !== 0 || mOut !== 0) {
+          lastNonZeroTimeRef.current = { hour: hOut, minute: mOut };
+        }
+
+        defer(() => {
+          // Drop stale commits from earlier wheel events
+          if (mySeq !== selectSeqRef.current) {
+            userChangeRef.current = false;
+            return;
+          }
           dispatch({
-            type: CalendarActionKind.CHANGE_CURRENT_DATE,
-            payload: newDate,
+            type: CalendarActionKind.CHANGE_SELECTED_DATE,
+            payload: { date: next },
           });
+          (onChange as SingleChange)({ date: next.toDate() });
+          userChangeRef.current = false;
+        });
+      } else if (mode === 'range') {
+        let start = removeTime(stateRef.current.startDate, timeZone);
+        let end = removeTime(stateRef.current.endDate, timeZone);
+        const selected = removeTime(selectedDate, timeZone);
+        let isStart: boolean = true;
+        let isReset: boolean = false;
 
-          (onChange as SingleChange)({
-            date: newDate ? dayjs(newDate).toDate() : newDate,
-          });
-        } else if (mode === 'range') {
-          // set time to 00:00:00
-          let start = removeTime(stateRef.current.startDate, timeZone);
-          let end = removeTime(stateRef.current.endDate, timeZone);
-          const selected = removeTime(selectedDate, timeZone);
-          let isStart: boolean = true;
-          let isReset: boolean = false;
+        if (
+          dateToUnix(selected) !== dateToUnix(end) &&
+          dateToUnix(selected) >= dateToUnix(start) &&
+          dateToUnix(start) !== dateToUnix(end)
+        ) {
+          isStart = false;
+        } else if (start && dateToUnix(selected) === dateToUnix(start)) {
+          isReset = true;
+        }
 
+        if (start && end) {
           if (
-            dateToUnix(selected) !== dateToUnix(end) &&
-            dateToUnix(selected) >= dateToUnix(start) &&
-            dateToUnix(start) !== dateToUnix(end)
+            dateToUnix(start) === dateToUnix(end) &&
+            dateToUnix(selected) > dateToUnix(start)
           ) {
             isStart = false;
-          } else if (start && dateToUnix(selected) === dateToUnix(start)) {
+          }
+
+          if (
+            dateToUnix(selected) > dateToUnix(start) &&
+            dateToUnix(selected) === dateToUnix(end)
+          ) {
+            end = undefined;
+          }
+        }
+
+        if (start && !end && dateToUnix(selected) < dateToUnix(start)) {
+          end = start;
+        }
+
+        if (isStart && end && (min || max)) {
+          const numberOfDays = dayjs(end).diff(selected, 'day');
+
+          if ((max && numberOfDays > max) || (min && numberOfDays < min)) {
+            isStart = true;
+            end = undefined;
+          }
+        }
+
+        if (!isStart && start && (min || max)) {
+          const numberOfDays = dayjs(selected).diff(start, 'day');
+
+          if (dateToUnix(selected) === dateToUnix(start)) {
             isReset = true;
+          } else if (
+            (max && numberOfDays > max) ||
+            (min && numberOfDays < min)
+          ) {
+            isStart = true;
+            end = undefined;
           }
+        }
 
-          if (start && end) {
-            if (
-              dateToUnix(start) === dateToUnix(end) &&
-              dateToUnix(selected) > dateToUnix(start)
-            ) {
-              isStart = false;
-            }
-
-            if (
-              dateToUnix(selected) > dateToUnix(start) &&
-              dateToUnix(selected) === dateToUnix(end)
-            ) {
-              end = undefined;
-            }
-          }
-
-          if (start && !end && dateToUnix(selected) < dateToUnix(start)) {
-            end = start;
-          }
-
-          if (isStart && end && (min || max)) {
-            const numberOfDays = dayjs(end).diff(selected, 'day');
-
-            if ((max && numberOfDays > max) || (min && numberOfDays < min)) {
-              isStart = true;
-              end = undefined;
-            }
-          }
-
-          if (!isStart && start && (min || max)) {
-            const numberOfDays = dayjs(selected).diff(start, 'day');
-
-            if (dateToUnix(selected) === dateToUnix(start)) {
-              isReset = true;
-            } else if (
-              (max && numberOfDays > max) ||
-              (min && numberOfDays < min)
-            ) {
-              isStart = true;
-              end = undefined;
-            }
-          }
-
-          if (isReset) {
+        if (isReset) {
+          defer(() => {
             (onChange as RangeChange)({
               startDate: undefined,
               endDate: undefined,
             });
-          } else {
+          });
+        } else {
+          defer(() => {
             (onChange as RangeChange)({
               startDate: isStart
                 ? dayjs(selected).toDate()
@@ -486,123 +572,146 @@ const DateTimePicker = (
                   ? dayjs.tz(getEndOfDay(end), timeZone).toDate()
                   : end,
             });
-          }
-        } else if (mode === 'multiple') {
-          const safeDates = (stateRef.current.dates as DateType[]) || [];
-          const newDate = dayjs(selectedDate, timeZone).startOf('day');
+          });
+        }
+      } else if (mode === 'multiple') {
+        const safeDates = (stateRef.current.dates as DateType[]) || [];
+        const newDate = dayjs(selectedDate as any)
+          .tz(timeZone, true)
+          .startOf('day');
 
-          const exists = safeDates.some((ed) => areDatesOnSameDay(ed, newDate));
+        const exists = safeDates.some((ed) => areDatesOnSameDay(ed, newDate));
+        const newDates = exists
+          ? safeDates.filter((ed) => !areDatesOnSameDay(ed, newDate))
+          : [...safeDates, newDate];
 
-          const newDates = exists
-            ? safeDates.filter((ed) => !areDatesOnSameDay(ed, newDate))
-            : [...safeDates, newDate];
+        if (max && newDates.length > max) return;
 
-          if (max && newDates.length > max) {
-            return;
-          }
+        newDates.sort((a, b) => (dayjs(a).isAfter(dayjs(b)) ? 1 : -1));
+        const _dates = newDates.map((d) => withTZ(d)) as DateType[];
 
-          newDates.sort((a, b) => (dayjs(a).isAfter(dayjs(b)) ? 1 : -1));
-
-          const _dates = newDates.map((date) =>
-            dayjs(date).tz(timeZone)
-          ) as DateType[];
-
+        defer(() => {
           (onChange as MultiChange)({
             dates: _dates.map((item) => dayjs(item).toDate()),
             datePressed: newDate ? dayjs(newDate).toDate() : newDate,
             change: exists ? 'removed' : 'added',
           });
-        }
+        });
       }
     },
-    [mode, timePicker, min, max, timeZone]
+    [
+      onChange,
+      mode,
+      timeZone,
+      withTZ,
+      seedHour,
+      seedMinute,
+      maxDate,
+      minDate,
+      min,
+      max,
+    ]
   );
 
   // set the active displayed month
   const onSelectMonth = useCallback(
     (value: number) => {
-      const currentMonth = dayjs(stateRef.current.currentDate).month();
-      const newDate = dayjs(stateRef.current.currentDate).month(value);
-
-      // Only call onMonthChange if the month actually changed
-      if (value !== currentMonth) {
-        onMonthChange(value);
-      }
-
-      dispatch({
-        type: CalendarActionKind.CHANGE_CURRENT_DATE,
-        payload: newDate,
+      const base = withTZ(stateRef.current.currentDate);
+      const currentMonth = base.month();
+      const newDate = base.month(value);
+      if (value !== currentMonth) onMonthChange(value);
+      defer(() => {
+        dispatch({
+          type: CalendarActionKind.CHANGE_CURRENT_DATE,
+          payload: newDate,
+        });
       });
       setCalendarView('day');
     },
-    [setCalendarView, onMonthChange]
+    [withTZ, onMonthChange, setCalendarView]
   );
 
   // set the active displayed year
   const onSelectYear = useCallback(
     (value: number) => {
-      const currentYear = dayjs(stateRef.current.currentDate).year();
-      const newDate = dayjs(stateRef.current.currentDate).year(value);
-
-      // Only call onYearChange if the year actually changed
-      if (value !== currentYear) {
-        onYearChange(value);
-      }
-
-      dispatch({
-        type: CalendarActionKind.CHANGE_CURRENT_DATE,
-        payload: newDate,
+      const base = withTZ(stateRef.current.currentDate);
+      const currentYear = base.year();
+      const newDate = base.year(value);
+      if (value !== currentYear) onYearChange(value);
+      defer(() => {
+        dispatch({
+          type: CalendarActionKind.CHANGE_CURRENT_DATE,
+          payload: newDate,
+        });
       });
       setCalendarView('day');
     },
-    [setCalendarView, onYearChange]
+    [withTZ, onYearChange, setCalendarView]
   );
 
+  // change month by offset
   const onChangeMonth = useCallback(
     (value: number) => {
-      const newDate = dayjs(stateRef.current.currentDate).add(value, 'month');
-      dispatch({
-        type: CalendarActionKind.CHANGE_CURRENT_DATE,
-        payload: dayjs(newDate),
+      const base = withTZ(stateRef.current.currentDate);
+      const newDate = base.add(value, 'month');
+      defer(() => {
+        dispatch({
+          type: CalendarActionKind.CHANGE_CURRENT_DATE,
+          payload: newDate,
+        });
       });
     },
-    [stateRef, dispatch]
+    [withTZ]
   );
 
-  const onChangeYear = useCallback(
-    (value: number) => {
+  const onChangeYear = useCallback((value: number) => {
+    defer(() => {
       dispatch({
         type: CalendarActionKind.CHANGE_CURRENT_YEAR,
         payload: value,
       });
-    },
-    [dispatch]
-  );
+    });
+  }, []);
 
-  useEffect(() => {
-    if (month !== undefined && month >= 0 && month <= 11) {
-      onSelectMonth(month);
-    }
-  }, [month]);
+  const onConfirm = useCallback(() => {
+    const base = withTZ(stateRef.current.date ?? stateRef.current.currentDate);
+    const h = typeof seedHour === 'number' ? seedHour : base.hour();
+    const m = typeof seedMinute === 'number' ? seedMinute : base.minute();
+    const merged = base.hour(h).minute(m);
 
-  useEffect(() => {
-    if (year !== undefined && year >= 0) {
-      onSelectYear(year);
+    const existing = withTZ(
+      stateRef.current.date ?? stateRef.current.currentDate
+    );
+    if (isSameMinute(existing, merged)) {
+      return;
     }
-  }, [year]);
+
+    if (h !== 0 || m !== 0) {
+      lastNonZeroTimeRef.current = { hour: h, minute: m };
+    }
+
+    defer(() => {
+      dispatch({
+        type: CalendarActionKind.CHANGE_SELECTED_DATE,
+        payload: { date: merged },
+      });
+      (onChange as SingleChange | undefined)?.({ date: merged.toDate() });
+    });
+  }, [withTZ, seedHour, seedMinute, onChange]);
+
+  // External month/year props
+  useEffect(() => {
+    if (month !== undefined && month >= 0 && month <= 11) onSelectMonth(month);
+  }, [month, onSelectMonth]);
+  useEffect(() => {
+    if (year !== undefined && year >= 0) onSelectYear(year);
+  }, [year, onSelectYear]);
 
   const memoizedStyles = useDeepCompareMemo({ ...styles }, [styles]);
-
   const memoizedClassNames = useDeepCompareMemo({ ...classNames }, [
     classNames,
   ]);
-
-  const memoizedComponents = useMemo(
-    () => ({
-      ...components,
-    }),
-    [components]
-  );
+  const memoizedComponents = useMemo(() => ({ ...components }), [components]);
 
   const baseContextValue = useMemo(
     () => ({
@@ -675,6 +784,7 @@ const DateTimePicker = (
       onSelectYear,
       onChangeMonth,
       onChangeYear,
+      onConfirm,
     }),
     [
       setCalendarView,
@@ -683,14 +793,12 @@ const DateTimePicker = (
       onSelectYear,
       onChangeMonth,
       onChangeYear,
+      onConfirm,
     ]
   );
 
   const styleContextValue = useMemo(
-    () => ({
-      classNames: memoizedClassNames,
-      styles: memoizedStyles,
-    }),
+    () => ({ classNames: memoizedClassNames, styles: memoizedStyles }),
     [memoizedClassNames, memoizedStyles]
   );
 
@@ -701,6 +809,7 @@ const DateTimePicker = (
       ...handlerContextValue,
       ...styleContextValue,
       components: memoizedComponents,
+      timeSeed,
     }),
     [
       state,
@@ -708,6 +817,7 @@ const DateTimePicker = (
       handlerContextValue,
       styleContextValue,
       memoizedComponents,
+      timeSeed,
     ]
   );
 
